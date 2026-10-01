@@ -24,7 +24,7 @@ def approx(value, rel=1e-6):
     return pytest.approx(float(value), rel=rel)
 
 
-def _add_activity(db, seed, scope, year, atype, qty, unit="t"):
+def _add_activity(db, seed, scope, year, atype, qty, unit="t", verified=1):
     act = ActivityData(
         company_id=seed["company"].id,
         scope_id=scope.id,
@@ -34,7 +34,7 @@ def _add_activity(db, seed, scope, year, atype, qty, unit="t"):
         unit=unit,
         quantity=qty,
         data_source="测试台账",
-        verified=1,
+        verified=verified,
     )
     db.add(act)
     db.commit()
@@ -91,6 +91,43 @@ class TestCalculationEngine:
         first = db.query(EmissionResult).count()
         recalc_company_year(db, seed["company"].id, 2025)
         assert db.query(EmissionResult).count() == first == 1
+
+    def test_unverified_activity_excluded_from_calculation(self, db, seed):
+        """未核验活动数据不得进入核算：结果表与年度合计均不含该数据。"""
+        _add_activity(db, seed, seed["scope2"], 2025, "外购电力", 2000, "MWh", verified=0)
+        count = recalc_company_year(db, seed["company"].id, 2025)
+        assert count == 0
+        assert db.query(EmissionResult).count() == 0
+        assert scope_totals(db, seed["company"].id, 2025)["2"] == 0
+        assert annual_total(db, seed["company"].id, 2025) == 0
+
+    def test_only_verified_activities_are_calculated(self, db, seed):
+        """已核验与未核验数据并存时，仅已核验部分进入核算。"""
+        _add_activity(db, seed, seed["scope2"], 2025, "外购电力", 2000, "MWh", verified=1)
+        _add_activity(db, seed, seed["scope2"], 2025, "外购电力", 5000, "MWh", verified=0)
+        count = recalc_company_year(db, seed["company"].id, 2025)
+        assert count == 1
+        assert annual_total(db, seed["company"].id, 2025) == approx(2000 * 0.5703, rel=1e-6)
+
+    def test_verify_then_recalc_includes_activity(self, db, seed):
+        """数据核验后重新核算方可计入结果。"""
+        act = _add_activity(db, seed, seed["scope2"], 2025, "外购电力", 2000, "MWh", verified=0)
+        recalc_company_year(db, seed["company"].id, 2025)
+        assert annual_total(db, seed["company"].id, 2025) == 0
+
+        act.verified = 1
+        db.commit()
+        recalc_company_year(db, seed["company"].id, 2025)
+        assert annual_total(db, seed["company"].id, 2025) == approx(2000 * 0.5703, rel=1e-6)
+
+    def test_new_unverified_activity_removed_on_recalc(self, db, seed):
+        """已核算数据新增未核验记录后重算：旧结果保留、未核验记录不污染。"""
+        _add_activity(db, seed, seed["scope2"], 2025, "外购电力", 2000, "MWh", verified=1)
+        recalc_company_year(db, seed["company"].id, 2025)
+        _add_activity(db, seed, seed["scope1"], 2025, "燃煤消耗", 100, verified=0)
+        recalc_company_year(db, seed["company"].id, 2025)
+        assert db.query(EmissionResult).count() == 1
+        assert annual_total(db, seed["company"].id, 2025) == approx(2000 * 0.5703, rel=1e-6)
 
 
 class TestQuotaAndCompliance:
@@ -356,6 +393,40 @@ class TestMrvReport:
         report = generate_report(db, seed["company"].id, 2025)
         with pytest.raises(ValueError, match="仅已提交"):
             approve_report(db, report, verifier_id=1)
+
+    def test_approve_blocked_when_unverified_activity_exists(self, db, seed):
+        """存在未核验活动数据时禁止批准报告，防止污染冻结与履约闭环。"""
+        from app.models import ComplianceRecord
+
+        _add_activity(db, seed, seed["scope2"], 2025, "外购电力", 2000, "MWh", verified=1)
+        _add_activity(db, seed, seed["scope2"], 2025, "外购电力", 3000, "MWh", verified=0)
+        recalc_company_year(db, seed["company"].id, 2025)
+        allocate_quota(db, seed["company"].id, 2025, baseline=1000, allocation_amount=5000)
+        report = generate_report(db, seed["company"].id, 2025)
+        submit_report(db, report)
+        with pytest.raises(ValueError, match="未核验"):
+            approve_report(db, report, verifier_id=1)
+        db.refresh(report)
+        assert report.status == "submitted"
+        assert db.query(ComplianceRecord).filter(ComplianceRecord.is_active == 1).count() == 0
+
+    def test_approve_allowed_after_verification_and_recalculation(self, db, seed):
+        """未核验数据完成核验并重新核算、重新生成报告后，批准链路恢复。"""
+        pending = _add_activity(db, seed, seed["scope2"], 2025, "外购电力", 3000, "MWh", verified=0)
+        _add_activity(db, seed, seed["scope2"], 2025, "外购电力", 2000, "MWh", verified=1)
+        recalc_company_year(db, seed["company"].id, 2025)
+        allocate_quota(db, seed["company"].id, 2025, baseline=1000, allocation_amount=5000)
+        report = generate_report(db, seed["company"].id, 2025)
+        submit_report(db, report)
+
+        pending.verified = 1
+        db.commit()
+        recalc_company_year(db, seed["company"].id, 2025)
+        report = generate_report(db, seed["company"].id, 2025)
+        submit_report(db, report)
+        approve_report(db, report, verifier_id=1)
+        assert report.status == "approved"
+        assert annual_total(db, seed["company"].id, 2025) == approx(5000 * 0.5703, rel=1e-6)
 
     def test_regenerate_resets_to_draft(self, db, seed):
         """重新生成报告重置为草稿。"""

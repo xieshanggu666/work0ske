@@ -16,7 +16,11 @@ views.CalculationView = () => {
     setMsg({ type: "", text: "" });
     try {
       const r = await api.post(`/api/companies/${companyId}/calculate?year=${year}`);
-      setMsg({ type: "ok", text: `核算完成：共 ${r.count} 条活动数据，年度排放 ${fmtNum(r.total)} tCO2e` });
+      setMsg({
+        type: r.unverified_count ? "warn" : "ok",
+        text: `核算完成：共 ${r.count} 条已核验活动数据，年度排放 ${fmtNum(r.total)} tCO2e`
+          + (r.warning ? `。${r.warning}` : ""),
+      });
       const res = await api.get(`/api/companies/${companyId}/results?year=${year}`);
       setResults({ list: res, totals: r.totals, total: r.total });
     } catch (err) {

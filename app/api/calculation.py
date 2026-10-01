@@ -4,7 +4,11 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.deps import ensure_company_access, get_current_user, require_roles
 from app.models import Company, EmissionResult, User
-from app.services.calculation_service import recalc_company_year, scope_totals
+from app.services.calculation_service import (
+    count_unverified_activities,
+    recalc_company_year,
+    scope_totals,
+)
 
 router = APIRouter(prefix="/api", tags=["calculation"])
 
@@ -16,8 +20,18 @@ def calculate(company_id: int, year: int, db: Session = Depends(get_db), user: U
         raise HTTPException(status_code=404, detail="企业不存在")
     ensure_company_access(user, company_id, "无权为该企业核算")
     count = recalc_company_year(db, company_id, year)
+    unverified_count = count_unverified_activities(db, company_id, year)
     totals = scope_totals(db, company_id, year)
-    return {"count": count, "totals": totals, "total": round(sum(totals.values()), 4)}
+    warning = ""
+    if unverified_count:
+        warning = f"有 {unverified_count} 条活动数据尚未核验，未纳入本次核算；核验通过后请重新核算"
+    return {
+        "count": count,
+        "unverified_count": unverified_count,
+        "warning": warning,
+        "totals": totals,
+        "total": round(sum(totals.values()), 4),
+    }
 
 
 @router.get("/companies/{company_id}/results")

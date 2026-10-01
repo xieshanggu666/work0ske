@@ -37,7 +37,7 @@ from app.models.allowance import (
 )
 from app.models.company import Company
 from app.models.report import MrvReport
-from app.services.calculation_service import annual_total
+from app.services.calculation_service import annual_total, count_unverified_activities
 
 
 def _today() -> str:
@@ -218,6 +218,16 @@ def freeze_allowance_for_report(
 
     company_id = report.company_id
     year = report.year
+
+    # 数据状态约束：存在未核验活动数据时禁止批准，防止未核查数据经报告快照
+    # 冻结配额、形成履约结果，污染年度配额闭环；核验并重新核算、重新生成报告后方可批准。
+    pending = count_unverified_activities(db, company_id, year)
+    if pending:
+        raise ValueError(
+            f"该企业{year}年度仍有 {pending} 条活动数据未核验，不能批准报告；"
+            "请先完成核验、重新核算并重新生成报告"
+        )
+
     emission = round(float(report.total_emission), 4)
     account = _get_account(db, company_id, year)
     keys = [company_clear_key(company_id, year)]

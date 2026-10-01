@@ -45,8 +45,30 @@ def compute_emission(
     return quantity * factor_value
 
 
+def count_unverified_activities(db: Session, company_id: int, year: int) -> int:
+    """统计企业某年度尚未经核查员核验的活动数据条数。
+
+    核算链路的数据状态约束：未核验（verified=0）的活动数据不得进入排放核算，
+    也不得进一步影响 MRV 报告、配额冻结与履约结果。
+    """
+    return (
+        db.query(ActivityData)
+        .filter(
+            ActivityData.company_id == company_id,
+            ActivityData.year == year,
+            ActivityData.verified == 0,
+        )
+        .count()
+    )
+
+
 def recalc_company_year(db: Session, company_id: int, year: int) -> int:
-    """重算某企业某年度全部活动数据的排放量（先清除旧结果保证幂等）。"""
+    """重算某企业某年度全部**已核验**活动数据的排放量（先清除旧结果保证幂等）。
+
+    数据状态约束：仅核查员核验通过（verified=1）的活动数据才允许进入核算，
+    未核验数据在源头被排除，避免污染核算结果及其后的年度报告、配额冻结和履约闭环。
+    活动数据完成核验后需重新触发核算方可计入结果。
+    """
     db.query(EmissionResult).filter(
         EmissionResult.company_id == company_id, EmissionResult.year == year
     ).delete()
@@ -54,7 +76,11 @@ def recalc_company_year(db: Session, company_id: int, year: int) -> int:
 
     activities = (
         db.query(ActivityData)
-        .filter(ActivityData.company_id == company_id, ActivityData.year == year)
+        .filter(
+            ActivityData.company_id == company_id,
+            ActivityData.year == year,
+            ActivityData.verified == 1,
+        )
         .all()
     )
     count = 0
