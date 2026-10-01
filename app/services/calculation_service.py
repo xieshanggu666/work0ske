@@ -3,6 +3,9 @@
 - activity_factor：排放量 = 活动量 × 排放因子值
 - fuel_combustion：排放量 = 燃料量 × 综合因子 × 碳氧化率 × 44/12
 因子按生效日期区间取当期有效版本。
+
+数据状态约束：只有核查员核验通过（verified=1）的活动数据才进入核算；
+未核验数据不产生核算结果，避免污染年度报告、配额冻结与履约闭环。
 """
 
 import json
@@ -46,7 +49,11 @@ def compute_emission(
 
 
 def recalc_company_year(db: Session, company_id: int, year: int) -> int:
-    """重算某企业某年度全部活动数据的排放量（先清除旧结果保证幂等）。"""
+    """重算某企业某年度已核验活动数据的排放量（先清除旧结果保证幂等）。
+
+    仅 verified=1 的活动数据参与核算；未核验数据被跳过，不产生核算结果。
+    数据核验后重新触发核算即可纳入（先清后算，幂等）。
+    """
     db.query(EmissionResult).filter(
         EmissionResult.company_id == company_id, EmissionResult.year == year
     ).delete()
@@ -54,7 +61,11 @@ def recalc_company_year(db: Session, company_id: int, year: int) -> int:
 
     activities = (
         db.query(ActivityData)
-        .filter(ActivityData.company_id == company_id, ActivityData.year == year)
+        .filter(
+            ActivityData.company_id == company_id,
+            ActivityData.year == year,
+            ActivityData.verified == 1,
+        )
         .all()
     )
     count = 0
@@ -84,6 +95,19 @@ def recalc_company_year(db: Session, company_id: int, year: int) -> int:
             count += 1
     db.commit()
     return count
+
+
+def unverified_activity_count(db: Session, company_id: int, year: int) -> int:
+    """统计某企业某年度尚未核验的活动数据条数（即核算时被跳过的部分）。"""
+    return (
+        db.query(ActivityData)
+        .filter(
+            ActivityData.company_id == company_id,
+            ActivityData.year == year,
+            ActivityData.verified != 1,
+        )
+        .count()
+    )
 
 
 def scope_totals(db: Session, company_id: int, year: int) -> dict:

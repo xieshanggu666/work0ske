@@ -8,6 +8,7 @@ from app.services.calculation_service import (
     get_factor_for_year,
     recalc_company_year,
     scope_totals,
+    unverified_activity_count,
 )
 from app.services.mrv_service import (
     approve_report,
@@ -24,7 +25,7 @@ def approx(value, rel=1e-6):
     return pytest.approx(float(value), rel=rel)
 
 
-def _add_activity(db, seed, scope, year, atype, qty, unit="t"):
+def _add_activity(db, seed, scope, year, atype, qty, unit="t", verified=1):
     act = ActivityData(
         company_id=seed["company"].id,
         scope_id=scope.id,
@@ -34,7 +35,7 @@ def _add_activity(db, seed, scope, year, atype, qty, unit="t"):
         unit=unit,
         quantity=qty,
         data_source="测试台账",
-        verified=1,
+        verified=verified,
     )
     db.add(act)
     db.commit()
@@ -91,6 +92,74 @@ class TestCalculationEngine:
         first = db.query(EmissionResult).count()
         recalc_company_year(db, seed["company"].id, 2025)
         assert db.query(EmissionResult).count() == first == 1
+
+
+class TestVerifiedDataGate:
+    """数据状态约束：未核验活动数据不得进入核算及后续闭环。"""
+
+    def test_unverified_activity_excluded_from_calculation(self, db, seed):
+        """未核验的活动数据不产生核算结果，年度合计为 0。"""
+        _add_activity(db, seed, seed["scope2"], 2025, "外购电力", 2000, "MWh", verified=0)
+        count = recalc_company_year(db, seed["company"].id, 2025)
+        assert count == 0
+        assert db.query(EmissionResult).count() == 0
+        assert annual_total(db, seed["company"].id, 2025) == approx(0)
+        assert unverified_activity_count(db, seed["company"].id, 2025) == 1
+
+    def test_mixed_data_only_verified_calculated(self, db, seed):
+        """已核验与未核验数据并存时，仅已核验数据进入核算。"""
+        _add_activity(db, seed, seed["scope2"], 2025, "外购电力", 2000, "MWh", verified=1)
+        _add_activity(db, seed, seed["scope1"], 2025, "燃煤消耗", 100, verified=0)
+        count = recalc_company_year(db, seed["company"].id, 2025)
+        assert count == 1
+        totals = scope_totals(db, seed["company"].id, 2025)
+        assert totals["2"] == approx(2000 * 0.5703, rel=1e-6)
+        assert totals["1"] == approx(0)
+        assert unverified_activity_count(db, seed["company"].id, 2025) == 1
+
+    def test_verify_then_recalc_picks_up_data(self, db, seed):
+        """核验后重新核算即纳入结果；重算同时清掉旧的未核验遗漏，保持幂等。"""
+        act = _add_activity(db, seed, seed["scope2"], 2025, "外购电力", 2000, "MWh", verified=0)
+        assert recalc_company_year(db, seed["company"].id, 2025) == 0
+
+        act.verified = 1
+        db.commit()
+        assert recalc_company_year(db, seed["company"].id, 2025) == 1
+        assert db.query(EmissionResult).count() == 1
+        assert annual_total(db, seed["company"].id, 2025) == approx(2000 * 0.5703, rel=1e-6)
+        assert unverified_activity_count(db, seed["company"].id, 2025) == 0
+
+    def test_unverified_data_not_polluting_report_freeze_and_compliance(self, db, seed):
+        """闭环：未核验数据不影响年度报告、配额冻结与履约记录。"""
+        from app.models import AllowanceAccount, ComplianceRecord
+
+        _add_activity(db, seed, seed["scope2"], 2025, "外购电力", 1000, "MWh", verified=1)
+        _add_activity(db, seed, seed["scope2"], 2025, "外购电力", 5000, "MWh", verified=0)
+        recalc_company_year(db, seed["company"].id, 2025)
+        verified_emission = 1000 * 0.5703
+        assert annual_total(db, seed["company"].id, 2025) == approx(verified_emission, rel=1e-6)
+
+        allocate_quota(db, seed["company"].id, 2025, baseline=10000, allocation_amount=10000)
+        report = generate_report(db, seed["company"].id, 2025)
+        assert float(report.total_emission) == approx(verified_emission, rel=1e-6)
+
+        submit_report(db, report)
+        approve_report(db, report, verifier_id=1)
+        record = db.query(ComplianceRecord).one()
+        account = db.query(AllowanceAccount).one()
+        assert float(record.verified_emission) == approx(verified_emission, rel=1e-6)
+        assert float(record.frozen_amount) == approx(verified_emission, rel=1e-6)
+        assert float(account.frozen_balance) == approx(verified_emission, rel=1e-6)
+
+    def test_unverified_data_not_counted_in_clearance_without_report(self, db, seed):
+        """无报告的手动清缴路径同样只按已核验数据核算履约义务。"""
+        _add_activity(db, seed, seed["scope2"], 2025, "外购电力", 1000, "MWh", verified=1)
+        _add_activity(db, seed, seed["scope2"], 2025, "外购电力", 5000, "MWh", verified=0)
+        recalc_company_year(db, seed["company"].id, 2025)
+        allocate_quota(db, seed["company"].id, 2025, baseline=10000, allocation_amount=10000)
+        record = clear_emission(db, seed["company"].id, 2025, "2025-12-31")
+        assert record.status == "compliant"
+        assert float(record.verified_emission) == approx(1000 * 0.5703, rel=1e-6)
 
 
 class TestQuotaAndCompliance:

@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.deps import ensure_company_access, get_current_user, require_roles
 from app.models import Company, EmissionResult, User
-from app.services.calculation_service import recalc_company_year, scope_totals
+from app.services.calculation_service import recalc_company_year, scope_totals, unverified_activity_count
 
 router = APIRouter(prefix="/api", tags=["calculation"])
 
@@ -17,7 +17,8 @@ def calculate(company_id: int, year: int, db: Session = Depends(get_db), user: U
     ensure_company_access(user, company_id, "无权为该企业核算")
     count = recalc_company_year(db, company_id, year)
     totals = scope_totals(db, company_id, year)
-    return {"count": count, "totals": totals, "total": round(sum(totals.values()), 4)}
+    skipped = unverified_activity_count(db, company_id, year)
+    return {"count": count, "skipped_unverified": skipped, "totals": totals, "total": round(sum(totals.values()), 4)}
 
 
 @router.get("/companies/{company_id}/results")
